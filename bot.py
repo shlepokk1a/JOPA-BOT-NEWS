@@ -179,6 +179,7 @@ async def write_post(session: aiohttp.ClientSession, title: str, text: str):
         "contents": [{"parts": [{"text": PROMPT.format(title=title, text=text)}]}],
         "generationConfig": {"temperature": 0.7},
     }
+    data = {}
     try:
         async with session.post(
             url,
@@ -189,12 +190,14 @@ async def write_post(session: aiohttp.ClientSession, title: str, text: str):
             data = await r.json()
         out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
-        log.warning("Gemini не ответил: %s", e)
-        return None
+        err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+        err = (err or repr(e))[:200]
+        log.warning("Gemini не ответил: %s", err)
+        return None, err
     out = re.sub(r"[*_`#]+", "", out).strip()
     if not out or out.upper().startswith("SKIP"):
-        return None
-    return out
+        return None, None
+    return out, None
 
 
 def build_caption(text: str) -> str:
@@ -226,16 +229,31 @@ async def create_post(bot: Bot) -> None:
         candidates = await get_candidates(session)
         pool = candidates[:10]
         random.shuffle(pool)
+        stats = {"no_article": 0, "no_image": 0, "bad_image": 0, "skip": 0}
+        ai_error = None
         for item in pool[:6]:
-            mark_seen(item["link"])
             article, image_url = await read_article(session, item["link"])
-            if not article or len(article) < 200 or not image_url:
+            if not article or len(article) < 200:
+                stats["no_article"] += 1
+                mark_seen(item["link"])
+                continue
+            if not image_url:
+                stats["no_image"] += 1
+                mark_seen(item["link"])
                 continue
             image = await download_image(session, image_url)
             if not image:
+                stats["bad_image"] += 1
+                mark_seen(item["link"])
                 continue
-            text = await write_post(session, item["title"], article)
+            text, err = await write_post(session, item["title"], article)
+            if err:
+                # Gemini сломан: новость не «сжигаем», попробуем её в следующий раз
+                ai_error = err
+                continue
+            mark_seen(item["link"])
             if not text:
+                stats["skip"] += 1
                 continue
             caption = build_caption(text)
             source = item["link"][:150]
@@ -262,7 +280,17 @@ async def create_post(bot: Bot) -> None:
             )
             db.commit()
             return
-    await bot.send_message(ADMIN_ID, "Сейчас не нашёл подходящую новость с картинкой.")
+    if not candidates:
+        reason = "Новых новостей в лентах нет или ленты не загрузились."
+    else:
+        reason = (
+            f"Новостей в лентах: {len(candidates)}. Пробовал: {len(pool[:6])}. "
+            f"Нет текста статьи: {stats['no_article']}, нет картинки: {stats['no_image']}, "
+            f"картинка не скачалась: {stats['bad_image']}, Gemini отказался писать: {stats['skip']}."
+        )
+        if ai_error:
+            reason += f"\nОшибка Gemini: {ai_error}"
+    await bot.send_message(ADMIN_ID, "Не получилось создать пост.\n" + html.escape(reason))
 
 
 # ---------- обработчики ----------
