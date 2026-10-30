@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+aiohttp>=3.9
+feedparser>=6.0
+beautifulsoup4>=4.12
