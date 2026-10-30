@@ -40,13 +40,19 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])          # твой Telegram ID (куда слать на одобрение)
 CHANNEL_ID = os.environ["CHANNEL_ID"]           # @username канала или -100...
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")
 POST_TIMES = [
     tuple(int(x) for x in t.strip().split(":"))
     for t in os.environ.get("POST_TIMES", "10:00,15:00,20:00").split(",")
 ]
 DB_PATH = os.environ.get("DB_PATH", "news_bot.db")
+# если основная модель перегружена или недоступна, бот пробует запасные по порядку
+MODELS = [GEMINI_MODEL] + [
+    m.strip()
+    for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.6-flash,gemini-3.1-flash-lite").split(",")
+    if m.strip()
+]
 
 FEEDS = [
     "https://habr.com/ru/rss/hubs/artificial_intelligence/all/",
@@ -173,17 +179,15 @@ async def download_image(session: aiohttp.ClientSession, url: str):
 
 
 # ---------- написание поста ----------
-async def write_post(session: aiohttp.ClientSession, title: str, text: str):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    body = {
-        "contents": [{"parts": [{"text": PROMPT.format(title=title, text=text)}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            # у gemini-3.8-flash по умолчанию «medium» думает долго, для поста хватает low
-            "thinkingConfig": {"thinkingLevel": "low"},
-        },
-    }
-    data = {}
+async def call_gemini(session: aiohttp.ClientSession, model: str, prompt: str, thinking: bool):
+    """Один запрос к Gemini. Возвращает (текст, ошибка, http-статус)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gen = {"temperature": 0.7}
+    if thinking:
+        # у новых моделей по умолчанию «думает» долго, для поста хватает low
+        gen["thinkingConfig"] = {"thinkingLevel": "low"}
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
+    data, status = {}, 0
     try:
         async with session.post(
             url,
@@ -191,17 +195,47 @@ async def write_post(session: aiohttp.ClientSession, title: str, text: str):
             json=body,
             timeout=aiohttp.ClientTimeout(total=120),
         ) as r:
+            status = r.status
             data = await r.json()
-        out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip(), None, status
     except Exception as e:
         err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-        err = (err or repr(e))[:200]
-        log.warning("Gemini не ответил: %s", err)
-        return None, err
-    out = re.sub(r"[*_`#]+", "", out).strip()
-    if not out or out.upper().startswith("SKIP"):
-        return None, None
-    return out, None
+        return None, (err or repr(e))[:200], status
+
+
+async def try_model(session: aiohttp.ClientSession, model: str, prompt: str):
+    """Пробует одну модель: при перегрузке ждёт и повторяет один раз. Возвращает (текст, ошибка)."""
+    err = None
+    for attempt in range(2):
+        out, err, status = await call_gemini(session, model, prompt, True)
+        if err and status == 400 and "thinking" in err.lower():
+            out, err, status = await call_gemini(session, model, prompt, False)
+        if not err:
+            return out, None
+        log.warning("Gemini %s не ответил (попытка %s): %s", model, attempt + 1, err)
+        busy = status in (429, 500, 503) or "high demand" in err or "overloaded" in err.lower()
+        if busy and attempt == 0:
+            await asyncio.sleep(10)
+            continue
+        break
+    return None, err
+
+
+async def write_post(session: aiohttp.ClientSession, title: str, text: str):
+    """Возвращает (текст поста, ошибка). Если основная модель занята, пробует запасные."""
+    prompt = PROMPT.format(title=title, text=text)
+    last_err = None
+    for model in MODELS:
+        out, err = await try_model(session, model, prompt)
+        if not err:
+            out = re.sub(r"[*_`#]+", "", out).strip()
+            if not out or out.upper().startswith("SKIP"):
+                return None, None
+            return out, None
+        last_err = f"{model}: {err}"
+        if "API key" in err:  # ключ неверный: запасные модели не помогут
+            break
+    return None, last_err
 
 
 def build_caption(text: str) -> str:
